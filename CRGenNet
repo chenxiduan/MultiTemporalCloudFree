@@ -1,0 +1,299 @@
+from math import sqrt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchgan.layers import SpectralNorm2d
+from dcswinv4 import dcswin_tiny, SpatialAttention, ChannelAttention  #, dcswin_tiny_ablation
+
+
+class OutConv(nn.Sequential):
+    def __init__(self, in_channels, num_classes):
+        super(OutConv, self).__init__(
+            nn.ReplicationPad2d(1),
+            nn.Conv2d(in_channels, in_channels // 2, kernel_size=3),
+            nn.InstanceNorm2d(in_channels // 2),
+            nn.Mish(inplace=True),
+            nn.Conv2d(in_channels // 2, num_classes, kernel_size=1),
+            nn.Tanh()
+        )
+
+
+class inConv(nn.Sequential):
+    def __init__(self, in_channels, out_channels):
+        super(inConv, self).__init__(nn.ReplicationPad2d(1),
+                                     nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1),
+                                     nn.InstanceNorm2d(out_channels),
+                                     nn.Mish(inplace=True))
+
+
+class ResBlock(nn.Module):
+    def __init__(self, in_features, ratio=2, direction='down', dropout_rate=0.1):
+        super(ResBlock, self).__init__()
+
+        if direction == 'down':
+            middle_features = in_features * ratio
+            self.conv = nn.Sequential(
+                nn.ReplicationPad2d(3),
+                nn.Conv2d(in_features, middle_features, kernel_size=7, stride=2),
+                nn.InstanceNorm2d(middle_features),
+                nn.Mish(inplace=True),
+                nn.ReplicationPad2d(1),
+                nn.Conv2d(middle_features, middle_features, 3, 1, ),
+                nn.InstanceNorm2d(middle_features),
+                nn.Mish(inplace=True)
+            )
+        elif direction == 'up':
+            middle_features = in_features // ratio
+            self.conv = nn.Sequential(
+                nn.ConvTranspose2d(in_features, middle_features, kernel_size=2, stride=2),
+                nn.InstanceNorm2d(middle_features),
+                nn.Mish(inplace=True),
+                nn.ReplicationPad2d(1),
+                nn.Conv2d(middle_features, middle_features, 3, 1, ),
+                nn.InstanceNorm2d(middle_features),
+                nn.Mish(inplace=True)
+            )
+
+        self.net = nn.Sequential(
+            nn.ReplicationPad2d(1),
+            nn.Conv2d(middle_features, middle_features, 3, 1, ),
+            nn.InstanceNorm2d(middle_features),
+            nn.Mish(inplace=True),
+            # @@@
+            nn.ReplicationPad2d(1),
+            nn.Conv2d(middle_features, middle_features, 3, 1, ),
+            nn.InstanceNorm2d(middle_features),
+            nn.Mish(inplace=True),
+            # &&&
+            nn.Conv2d(middle_features, middle_features, 1, 1, 0),
+            nn.Dropout2d(dropout_rate),
+        )
+
+    def forward(self, x):
+        x = self.conv(x)
+        return self.net(x) + x
+
+
+def l2_norm(x):
+    return torch.einsum("bcn, bn->bcn", x, 1 / torch.norm(x, p=2, dim=-2))
+
+class SelfAttention(nn.Module):
+    def __init__(self, in_places, eps=1e-6):
+        """
+        Args:
+            in_places: Number of input channels (C).
+            eps: Small value for numerical stability in denominators.
+        """
+        super(SelfAttention, self).__init__()
+        self.gamma = nn.Parameter(torch.zeros(1))  # learnable scale
+        self.in_places = in_places
+        self.eps = eps
+
+        # 1x1 convolutions for Q, K, and V
+        self.query_conv1 = nn.Conv2d(in_channels=in_places, out_channels=in_places // 8, kernel_size=1)
+        self.key_conv1   = nn.Conv2d(in_channels=in_places, out_channels=in_places // 8, kernel_size=1)
+        self.value_conv1 = nn.Conv2d(in_channels=in_places, out_channels=in_places,      kernel_size=1)
+
+        self.query_conv2 = nn.Conv2d(in_channels=in_places, out_channels=in_places // 8, kernel_size=1)
+        self.key_conv2   = nn.Conv2d(in_channels=in_places, out_channels=in_places // 8, kernel_size=1)
+        self.value_conv2 = nn.Conv2d(in_channels=in_places, out_channels=in_places,      kernel_size=1)
+
+        # L2 normalization function
+        self.l2_norm = lambda x: F.normalize(x, p=2, dim=-1)
+
+    def forward(self, x1, x2):
+        """
+        Args:
+            x1: First input feature map of shape (B, C, H, W)
+            x2: Second input feature map of shape (B, C, H, W)
+        Returns:
+            A tuple of two tensors (out1, out2), each of shape (B, C, H, W).
+        """
+        batch_size, channels, height, width = x1.shape
+
+        # 1) Compute Q, K, V for both inputs
+        Q1 = self.query_conv1(x1)   # (B, C//8, H, W)
+        K1 = self.key_conv1(x1)     # (B, C//8, H, W)
+        V1 = self.value_conv1(x1)   # (B, C,    H, W)
+
+        Q2 = self.query_conv2(x2)   # (B, C//8, H, W)
+        K2 = self.key_conv2(x2)     # (B, C//8, H, W)
+        V2 = self.value_conv2(x2)   # (B, C,    H, W)
+
+        # 2) Concatenate Q1, Q2 => Q; and K1, K2 => K
+        #    along the channel dimension: shape => (B, 2*C//8, H, W)
+        Q = torch.cat([Q1, Q2], dim=1)
+        K = torch.cat([K1, K2], dim=1)
+
+        # 3) Flatten spatial dimensions and L2 normalize
+        #    Q shape: (B, 2*C//8, H*W) => then permute to (B, H*W, 2*C//8)
+        #    K shape: (B, 2*C//8, H*W)
+        Q = Q.view(batch_size, -1, height * width)     # (B, 2*C//8, N)
+        K = K.view(batch_size, -1, height * width)     # (B, 2*C//8, N)
+        Q = self.l2_norm(Q).permute(0, 2, 1)           # (B, N, 2*C//8)
+        K = self.l2_norm(K)                            # (B, 2*C//8, N)
+
+        # 4) Flatten V1 and V2
+        #    Each of shape (B, C, H*W)
+        V1 = V1.view(batch_size, channels, height * width)
+        V2 = V2.view(batch_size, channels, height * width)
+
+        # 5) Compute the "tailor_sum" denominator, shared for both branches
+        #    sums over channels of K, then does Q · sum(K) for each position
+        tailor_sum = 1.0 / (
+            (height * width) +
+            torch.einsum("bnc, bc->bn", Q, torch.sum(K, dim=-1)) +
+            self.eps
+        )
+        # shape of tailor_sum => (B, N)
+
+        # 6) Summation across V for baseline (value_sum)
+        #    sum over N => (B, C), then expand back to (B, C, N)
+        value_sum1 = torch.einsum("bcn->bc", V1).unsqueeze(-1)   # (B, C, 1)
+        value_sum1 = value_sum1.expand(-1, channels, height * width)  # (B, C, N)
+
+        value_sum2 = torch.einsum("bcn->bc", V2).unsqueeze(-1)   # (B, C, 1)
+        value_sum2 = value_sum2.expand(-1, channels, height * width)  # (B, C, N)
+
+        # 7) Build the cross-term: matrix1 from (K, V1), matrix2 from (K, V2)
+        #    shape => (B, 2*C//8, N) x (B, C, N) => (B, 2*C//8, C)
+        matrix1 = torch.einsum("bmn, bcn->bmc", K, V1)  # (B, 2*C//8, C)
+        matrix2 = torch.einsum("bmn, bcn->bmc", K, V2)  # (B, 2*C//8, C)
+
+        # 8) Combine Q * matrix + baseline:
+        #    Q: (B, N, 2*C//8), matrix: (B, 2*C//8, C)
+        #    => result is (B, N, C). We'll rearrange to (B, C, N) at the end.
+        matrix_sum1 = value_sum1 + torch.einsum("bnm, bmc->bcn", Q, matrix1)
+        matrix_sum2 = value_sum2 + torch.einsum("bnm, bmc->bcn", Q, matrix2)
+
+        # 9) Multiply by tailor_sum along N: shape => (B, C, N)
+        weight_value1 = torch.einsum("bcn, bn->bcn", matrix_sum1, tailor_sum)
+        weight_value2 = torch.einsum("bcn, bn->bcn", matrix_sum2, tailor_sum)
+
+        # 10) Reshape back to (B, C, H, W)
+        weight_value1 = weight_value1.view(batch_size, channels, height, width)
+        weight_value2 = weight_value2.view(batch_size, channels, height, width)
+
+        # 11) Residual connection with learnable gamma, producing two outputs
+        out1 = x1 + self.gamma * weight_value1
+        out2 = x2 + self.gamma * weight_value2
+
+        return torch.cat((out1.contiguous(), out2.contiguous()), dim=1)
+
+
+class Gen(nn.Module):
+    def __init__(self):
+        super(Gen, self).__init__()
+
+        self.input = nn.Sequential(
+            nn.ReplicationPad2d(1),
+            nn.Conv2d(6, 64, kernel_size=3),
+            nn.InstanceNorm2d(64),
+            nn.Mish(inplace=True),
+        )
+
+        self.down_1 = ResBlock(64, direction='down')
+        self.down_2 = ResBlock(128, direction='down')
+
+        self.up_1 = ResBlock(256, direction='up')
+        self.up_2 = ResBlock(128, direction='up')
+
+        self.OutConv = OutConv(128, 3)
+        self.InConv = inConv(2, 64)
+
+        self.s1_transform = nn.Sequential(
+            nn.ReplicationPad2d(1),
+            nn.Conv2d(2, 3, kernel_size=3),
+            nn.Mish(inplace=True),
+        )
+
+        self.transformer = dcswin_tiny()
+        self.att = SelfAttention(64)
+
+    def forward(self, a, c, d):
+        a = self.s1_transform(a)
+        x_0 = torch.cat([a, d], dim=1)
+        x_1 = self.input(x_0)
+        # print(x_1.shape)
+        x_1 = self.down_1(x_1)
+        # print(x_1.shape)
+        x_2 = self.down_2(x_1)
+        # print(x_2.shape)
+        x_3 = self.up_1(x_2)
+        # print(x_3.shape)
+        x_4 = self.up_2(x_3)
+        # print(x_4.shape)
+        x_r = self.InConv(c)
+        # print('x_r.shape:', x_r.shape)
+        # print('x_4.shape:', x_4.shape)        
+        x_5 = self.att(x_r, x_4)
+        # x_5 = torch.cat([x_r, x_4], dim=1)        
+        # print(x_5.shape)
+        x_6 = self.OutConv(x_5)        
+        output = self.transformer(x_6)
+        return x_6, output
+
+
+class ResidulBlockWithSpectralNormSimple(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(ResidulBlockWithSpectralNormSimple, self).__init__()
+        # Residual block with transformer and spectral norm
+        self.residual = nn.Sequential(
+            nn.BatchNorm2d(in_channels),
+            nn.Mish(inplace=True),
+            SpectralNorm2d(nn.Conv2d(in_channels, out_channels, 4, 2, 1)),
+            nn.BatchNorm2d(out_channels),
+            nn.Mish(inplace=True),
+            SpectralNorm2d(nn.Conv2d(out_channels, out_channels, 3, 1, 1)),
+        )
+
+    def forward(self, inputs):
+        return self.residual(inputs)
+
+
+class Discriminator(nn.Sequential):
+    def __init__(self, channels, *args):
+        super().__init__(*args)
+        layers = []
+        for i in range(1, len(channels)):
+            # Use the residual block with transformer
+            layers.append(ResidulBlockWithSpectralNormSimple(channels[i - 1], channels[i]))
+            # layers.append(nn.Dropout(0.5))
+
+            # Output layer (produces a single prediction value)
+        layers.append(ChannelAttention())
+        layers.append(SpatialAttention(channels[-1]))
+        layers.append(SpectralNorm2d(nn.Conv2d(channels[-1], 1, kernel_size=3, padding=1)))
+        layers.append(nn.Sigmoid())  # Sigmoid for probability output
+
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, inputs):
+        return self.model(inputs)
+
+
+class TSDiscriminator(nn.Module):
+    def __init__(self):
+        super(TSDiscriminator, self).__init__()
+
+        self.d1 = Discriminator((10, 32, 64, 128, 256))
+        self.d2 = Discriminator((10, 64, 128, 256))
+        self.d3 = Discriminator((10, 128, 256))
+
+
+    def forward(self, inputs):
+        l1 = self.d1(inputs)
+        l2 = self.d2(F.interpolate(inputs, scale_factor=0.5))
+        l3 = self.d3(F.interpolate(inputs, scale_factor=0.25))
+        L = l1 + l2 + l3
+        return L
+
+
+if __name__ == '__main__':
+    a = torch.randn(1, 2, 256, 256).cuda()
+    c = torch.randn(1, 2, 256, 256).cuda()
+    d = torch.randn(1, 3, 256, 256).cuda()
+    e = torch.randn(1, 10, 256, 256).cuda()
+
+    net = Gen().eval().cuda()
+    y = net(a, c, d)
